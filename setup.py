@@ -14,7 +14,8 @@ def install_packages():
         "tree-sitter-java==0.23.5",
         "tree-sitter-python==0.25.0",
         "tree-sitter-javascript==0.25.0",
-        "tree-sitter-cpp==0.23.4"
+        "tree-sitter-cpp==0.23.4",
+        "datasets==3.3.2",
         # Note: tree-sitter-erlang is not available on PyPI, so you can install it manually from the GitHub repository:
         # https://github.com/the-mikedavis/tree-sitter-erlang/tarball/master
     ]
