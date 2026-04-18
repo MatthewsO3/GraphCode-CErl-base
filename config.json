@@ -1,0 +1,36 @@
+{
+  "train": {
+    "data_file": "path_to_data",
+    "output_dir": "output_dir",
+    "checkpoint_path": "",
+    "batch_size": 32,
+    "epochs": 6,
+    "learning_rate": 2e-5,
+    "max_length": 256,
+    "warmup_steps": 2000,
+    "mlm_probability": 0.15,
+    "validation_split": 0.15,
+    "weight_decay": 0.01,
+    "early_stopping_patience": 3
+  },
+  "evaluate": {
+    "model": "MatthewsO3/GraphCode-CErl-base",
+    "mask_ratio": 0.15,
+    "top_k": 10,
+    "max_examples": 1000,
+    "langs": [
+      "python",
+      "java",
+      "javascript",
+      "cpp",
+      "erlang"
+    ],
+    "data_files": [
+      "data/python.jsonl",
+      "data/java.jsonl",
+      "data/js.jsonl",
+      "data/cpp.jsonl",
+      "data/erlang.jsonl"
+    ]
+  }
+}
