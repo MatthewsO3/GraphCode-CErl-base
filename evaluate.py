@@ -166,7 +166,11 @@ class UnifiedMLMEvaluator:
             code = sample.get('code') or sample.get('source_code', "")
             code_tokens = self.tokenizer.tokenize(code)
             dfg = self.get_dfg_from_source(code, lang)
-
+        MAX_DFG = min(64, self.max_seq_length // 4)
+        MAX_CODE = self.max_seq_length - MAX_DFG - 3
+        
+        # Truncate code_tokens immediately so candidate_positions are always valid
+        code_tokens = code_tokens[:MAX_CODE]
         code_tokens = [t for t in code_tokens if t not in (self.tokenizer.cls_token, self.tokenizer.sep_token)]
         
         # Filtering logic for comparable perplexity
