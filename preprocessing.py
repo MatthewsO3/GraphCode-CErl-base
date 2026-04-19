@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -294,6 +295,126 @@ def stream_dataset(lang: str, output_file: str, max_samples: int) -> None:
                 pbar.update(1)
 
 
+def _load_erlang_samples(erlang_file: str) -> list[dict]:
+    """Read the Erlang JSONL file, tokenizing raw samples where needed.
+
+    Each line is parsed as JSON.  If a record already contains
+    ``"code_tokens"`` it is kept as-is (already preprocessed).  Otherwise
+    the ``"code"`` or ``"source_code"`` field is tokenized with the
+    GraphCodeBERT tokenizer.  Because Tree-sitter Erlang may not be
+    installed, DFG extraction is skipped entirely for Erlang and a one-time
+    warning is printed to inform the user.
+
+    Records that contain neither ``"code_tokens"`` nor a recognisable source
+    field are skipped with a per-line warning.
+
+    :param erlang_file: Path to the Erlang JSONL file.
+    :returns: List of sample dicts, each guaranteed to have ``"code_tokens"``.
+    """
+    tokenizer = RobertaTokenizer.from_pretrained("microsoft/graphcodebert-base")
+    samples: list[dict] = []
+    needs_tokenization = False
+
+    with open(erlang_file, encoding="utf-8") as fh:
+        lines = [l for l in fh if l.strip()]
+
+    for i, line in enumerate(tqdm(lines, desc="Loading Erlang")):
+        record = json.loads(line)
+
+        if "code_tokens" in record:
+            samples.append(record)
+            continue
+
+        # Record is raw — needs tokenizing.
+        code = record.get("code") or record.get("source_code", "")
+        if not code:
+            print(
+                f"[erlang] Warning: line {i} has no 'code_tokens', 'code', or "
+                f"'source_code' field — skipping."
+            )
+            continue
+
+        if not needs_tokenization:
+            print(
+                "\n[erlang] Warning: provided file contains raw source code without "
+                "'code_tokens'. Tokenizing with the GraphCodeBERT tokenizer. "
+                "DFG extraction is skipped for Erlang because Tree-sitter support "
+                "cannot be guaranteed — samples will have no 'dataflow_graph' field."
+            )
+            needs_tokenization = True
+
+        tokens = tokenizer.tokenize(code, add_prefix_space=True)
+        if not (10 < len(tokens) < 450):
+            continue
+
+        record["code_tokens"] = tokens
+        record.setdefault("language", "erlang")
+        record.setdefault("idx", f"erlang::{i}")
+        record.pop("dataflow_graph", None)  # ensure no stale DFG field
+        samples.append(record)
+
+    return samples
+
+
+def merge_and_shuffle_training_data(
+    erlang_file: str,
+    output_file: str = "data/train.jsonl",
+    cpp_file: str = "data/cpp_processed.jsonl",
+) -> int:
+    """Merge C++ and Erlang samples into a balanced, shuffled training file.
+
+    Reads the C++ JSONL and the Erlang JSONL (tokenizing any raw Erlang
+    samples via :func:`_load_erlang_samples`), balances both corpora to the
+    size of the smaller one, shuffles the combined list with a fixed seed,
+    and writes the result to ``output_file``.
+
+    The function is a no-op (with a warning) when either source file is
+    missing.
+
+    :param erlang_file: Path to the externally provided Erlang JSONL file.
+    :param output_file: Destination path for the merged JSONL file.
+    :param cpp_file: Path to the preprocessed C++ JSONL file.
+    :returns: Total number of samples written, or ``0`` if either source
+        file was missing.
+    """
+    missing = [p for p in (cpp_file, erlang_file) if not os.path.exists(p)]
+    if missing:
+        print(
+            f"\n[merge] Warning: cannot build train.jsonl — missing file(s): "
+            f"{', '.join(missing)}"
+        )
+        return 0
+
+    def read_jsonl(path: str) -> list[dict]:
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    cpp_samples = read_jsonl(cpp_file)
+    erlang_samples = _load_erlang_samples(erlang_file)
+
+    # Balance to the smaller corpus so both languages contribute equally.
+    n = min(len(cpp_samples), len(erlang_samples))
+    if len(cpp_samples) != len(erlang_samples):
+        print(
+            f"\n[merge] Corpus sizes differ — C++: {len(cpp_samples)}, "
+            f"Erlang: {len(erlang_samples)}. Using {n} samples from each."
+        )
+
+    combined = cpp_samples[:n] + erlang_samples[:n]
+    random.shuffle(combined)
+
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as fh:
+        for sample in combined:
+            fh.write(json.dumps(sample, ensure_ascii=False) + "\n")
+
+    print(
+        f"\n[merge] Wrote {len(combined)} samples "
+        f"({n} C++ + {n} Erlang) \u2192 {output_file}"
+    )
+    return len(combined)
+
+
 def load_config(config_path: str = "config.json") -> dict:
     """Load the preprocessing section from ``config.json``.
 
@@ -378,8 +499,21 @@ def main() -> None:
 
     for lg in langs:
         output_path = f"data/{lg}_processed.jsonl"
-        print(f"\n--- Preprocessing {lg} → {output_path} ---")
+        print(f"\n--- Preprocessing {lg} \u2192 {output_path} ---")
         stream_dataset(lg, output_path, max_samples)
+
+    # After all per-language files are written, build the merged training file
+    # from the C++ and Erlang corpora (the two training languages).
+    # The Erlang path must be declared in config.json under preprocess.erlang_file
+    # since Erlang data cannot be downloaded via the standard pipeline.
+    erlang_file = cfg.get("erlang_file")
+    if not erlang_file:
+        print(
+            "\n[merge] Skipping train.jsonl — no 'erlang_file' key found in "
+            "config.json under the 'preprocess' section."
+        )
+    else:
+        merge_and_shuffle_training_data(erlang_file=erlang_file)
 
     print("\nPreprocessing complete.")
 

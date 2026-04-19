@@ -1,7 +1,8 @@
 {
   "preprocess": {
     "lang": "all",
-    "max_samples": 250000
+    "max_samples": 250000,
+    "erlang_file": "data/erlang_data.jsonl"
   },
 
   "train": {
