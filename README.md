@@ -411,7 +411,7 @@ Metrics reported per language:
 | Key | Default | Description |
 |---|---|---|
 | `lang` | `"cpp"` | Language to preprocess: `cpp`, `python`, `java`, `javascript`, or `all` |
-| `max_samples` | `10` | Maximum samples to collect per language |
+| `max_samples` | `250.000` | Maximum samples to collect per language |
 | `erlang_file` | — | Path to a local Erlang JSONL file. Required to produce `data/train.jsonl` |
 
 ### `train`
