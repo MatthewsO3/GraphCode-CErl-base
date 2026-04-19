@@ -240,6 +240,12 @@ class UnifiedMLMEvaluator:
                 adj[use_idx].append(node_map[def_pos])
 
         nodes = nodes[:MAX_DFG]
+        n_nodes = len(nodes)
+        adj = {
+            i: [j for j in neighbors if j < n_nodes]
+            for i, neighbors in adj.items()
+            if i < n_nodes
+        }
         tokens = [self.tokenizer.cls_token] + masked_tokens + [self.tokenizer.sep_token]
         dfg_start = len(tokens)
         tokens.extend([self.tokenizer.unk_token] * len(nodes))
