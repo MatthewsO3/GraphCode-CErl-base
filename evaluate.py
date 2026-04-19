@@ -360,29 +360,129 @@ class UnifiedMLMEvaluator:
                 **{k: v.to(self.device) for k, v in inputs.items()}
             ).logits
 
-        results: dict[str, Any] = {"t1": 0, "t5": 0, "lp": [], "total": 0}
+        # Store original token strings alongside IDs so accuracy uses string
+        # comparison (matching the reference script) while perplexity uses the
+        # stored ID directly — never a re-lookup that could hit unk_token_id.
+        orig_toks = [code_tokens[i] for i in mask_pos]
+
+        top1_correct = top5_correct = 0
+        log_probs: list[float] = []
+
         for i, pos in enumerate(mask_pos):
             if orig_ids[i] is None:
                 continue
 
             probs = torch.softmax(logits[0, pos + 1], dim=-1)
-            target_id = orig_ids[i]
 
+            # Accuracy: compare predicted token strings against the original string.
             _, top_indices = torch.topk(probs, top_k)
-            if target_id == top_indices[0]:
-                results["t1"] += 1
-            if target_id in top_indices[:5]:
-                results["t5"] += 1
+            top_preds = self.tokenizer.convert_ids_to_tokens(top_indices)
+            for rank, pred in enumerate(top_preds, 1):
+                if pred == orig_toks[i]:
+                    if rank == 1:
+                        top1_correct += 1
+                    if rank <= 5:
+                        top5_correct += 1
+                    break
 
-            results["lp"].append(np.log(max(probs[target_id].item(), 1e-9)))
-            results["total"] += 1
+            # Perplexity: use the stored ID directly, never re-lookup.
+            correct_prob = probs[orig_ids[i]].item()
+            log_probs.append(np.log(max(correct_prob, 1e-9)))
 
-        return results if results["total"] > 0 else None
+        if not log_probs:
+            return None
+
+        return {
+            "top1_correct": top1_correct,
+            "top5_correct": top5_correct,
+            "num_masked":   len(log_probs),
+            "log_probs":    log_probs,
+        }
+
+
+def print_lang_results(lang: str, metrics: dict[str, Any]) -> None:
+    """Print a formatted results block for one language, matching the reference
+    script's output style.
+
+    :param lang: Display label for the language.
+    :param metrics: Aggregated metrics dict as built in :func:`main`.
+    """
+    total = metrics["total_masked_tokens"]
+    print("\n" + "=" * 70)
+    print(f"Evaluation Results — {lang}".center(70))
+    print("=" * 70)
+    print(f"Snippets evaluated:     {metrics['snippets_evaluated']}")
+    print(f"Total masked tokens:    {total}")
+    print("-" * 70)
+    print(f"Top-1 Accuracy:         {metrics['top1_accuracy']:.2%}"
+          f" ({metrics['top1_correct']}/{total})")
+    print(f"Top-5 Accuracy:         {metrics['top5_accuracy']:.2%}"
+          f" ({metrics['top5_correct']}/{total})")
+    print(f"Perplexity:             {metrics['perplexity']:.4f}")
+    print("=" * 70 + "\n")
+
+
+def save_lang_results(
+    lang: str,
+    metrics: dict[str, Any],
+    snippets_skipped: int,
+    config: dict[str, Any],
+    output_dir: Path,
+) -> None:
+    """Print and persist per-language evaluation results.
+
+    Prints a formatted results block, then writes a single JSON file to
+    ``<output_dir>/eval_<lang>.json`` with the same structure produced by
+    the reference ``python_eval.py`` script.
+
+    :param lang: Language identifier used in the filename.
+    :param metrics: Aggregated metrics dict with keys ``"snippets_evaluated"``,
+        ``"total_masked_tokens"``, ``"top1_correct"``, ``"top5_correct"``,
+        ``"top1_accuracy"``, ``"top5_accuracy"``, and ``"perplexity"``.
+    :param snippets_skipped: Number of samples that returned no results.
+    :param config: Configuration dict to embed in the saved file.
+    :param output_dir: Directory to write the JSON file into.
+    """
+    if metrics["total_masked_tokens"] == 0:
+        print(f"[eval] No results for {lang} — skipping save.")
+        return
+
+    print_lang_results(lang, metrics)
+
+    results_serializable = {
+        "snippets_evaluated":  metrics["snippets_evaluated"],
+        "total_masked_tokens": metrics["total_masked_tokens"],
+        "top1_accuracy":       float(metrics["top1_accuracy"]),
+        "top5_accuracy":       float(metrics["top5_accuracy"]),
+        "perplexity":          float(metrics["perplexity"]),
+        "top1_correct":        int(metrics["top1_correct"]),
+        "top5_correct":        int(metrics["top5_correct"]),
+        "snippets_skipped":    snippets_skipped,
+        "config":              config,
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"eval_{lang}.json"
+
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(results_serializable, fh, indent=2)
+
+    print(f"[eval] Saved {lang} results → {out_path}")
 
 
 def main() -> None:
-    """
-    Entry point for the unified MLM evaluation script.
+    """Entry point for the unified MLM evaluation script.
+
+    Reads all configuration from ``config.json``.  The model path defaults to
+    ``<train.output_dir>/best_model`` so evaluation always runs against the
+    best checkpoint produced by training, but can be overridden by setting
+    ``evaluate.model`` explicitly.
+
+    Per-language results are saved to
+    ``<train.output_dir>/best_model/eval_<lang>.json``.  A combined summary
+    across all languages is saved to ``eval_summary.json`` in the same
+    directory.  Both files use the same indented JSON format as the reference
+    ``python_eval.py`` script.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config.json")
@@ -390,24 +490,49 @@ def main() -> None:
 
     with open(args.config, "r") as f:
         full_config = json.load(f)
-        eval_config = full_config.get("evaluate", {})
-        max_length = full_config.get("train", {}).get("max_length", 512)
 
-    model_path = eval_config.get("model")
-    langs = eval_config.get("langs", [])
+    eval_config  = full_config.get("evaluate", {})
+    train_config = full_config.get("train", {})
+    max_length   = train_config.get("max_length", 512)
+
+    # Resolve the model path: explicit evaluate.model > best_model under output_dir.
+    output_dir = train_config.get("output_dir")
+    if not output_dir:
+        raise ValueError("'output_dir' must be set under 'train' in config.json.")
+
+    best_model_dir = Path(output_dir) / "best_model"
+    model_path = eval_config.get("model") or str(best_model_dir)
+
+    langs      = eval_config.get("langs", [])
     data_files = eval_config.get("data_files", [])
     mask_ratio = eval_config.get("mask_ratio", 0.15)
-    top_k = eval_config.get("top_k", 10)
-    max_ex = eval_config.get("max_examples", 1000)
+    top_k      = eval_config.get("top_k", 10)
+    max_ex     = eval_config.get("max_examples", 1000)
+
+    print(f"\n{'=' * 70}")
+    print(f"  MLM EVALUATION")
+    print(f"{'=' * 70}")
+    print(f"  Model      : {model_path}")
+    print(f"  Languages  : {langs}")
+    print(f"  Mask ratio : {mask_ratio}")
+    print(f"  Max samples: {max_ex}")
+    print(f"  Output dir : {best_model_dir}")
+    print(f"{'=' * 70}\n")
 
     evaluator = UnifiedMLMEvaluator(model_path, max_seq_length=max_length)
 
-    all_metrics = []
+    # lang_metrics stores the full aggregated dict per language so we can
+    # compute a weighted combined perplexity at the end (same as reference script).
+    lang_metrics: dict[str, dict[str, Any]] = {}
+
     for file_path, lang in zip(data_files, langs):
         print(f"\n--- Evaluating {lang} from {file_path} ---")
-        metrics: dict[str, Any] = {"t1": 0, "t5": 0, "total": 0, "lp": []}
+
+        total_top1 = total_top5 = total_masked = snippets = snippets_skipped = 0
+        all_log_probs: list[float] = []
 
         if not os.path.exists(file_path):
+            print(f"[eval] Warning: {file_path} not found — skipping {lang}.")
             continue
 
         with open(file_path, "r") as f:
@@ -415,21 +540,98 @@ def main() -> None:
             if max_ex:
                 lines = lines[:max_ex]
 
-            for line in tqdm(lines, desc=f"Processing {lang}"):
-                sample = json.loads(line)
-                res = evaluator.evaluate_sample(sample, lang.lower(), mask_ratio, top_k)
-                if res:
-                    metrics["t1"] += res["t1"]
-                    metrics["t5"] += res["t5"]
-                    metrics["total"] += res["total"]
-                    metrics["lp"].extend(res["lp"])
+        for line in tqdm(lines, desc=f"Processing {lang}"):
+            sample = json.loads(line)
+            res = evaluator.evaluate_sample(sample, lang.lower(), mask_ratio, top_k)
+            if not res:
+                snippets_skipped += 1
+                continue
 
-        if metrics["total"] > 0:
-            ppl = np.exp(-np.mean(metrics["lp"]))
-            print(
-                f"Results for {lang}: Top-1: {metrics['t1']/metrics['total']:.2%}, PPL: {ppl:.4f}"
-            )
-            all_metrics.append(metrics)
+            total_top1    += res["top1_correct"]
+            total_top5    += res["top5_correct"]
+            total_masked  += res["num_masked"]
+            all_log_probs += res["log_probs"]
+            snippets      += 1
+
+        if total_masked == 0:
+            print(f"[eval] No valid results for {lang}.")
+            continue
+
+        mean_lp = float(np.mean(all_log_probs))
+        metrics: dict[str, Any] = {
+            "snippets_evaluated":  snippets,
+            "total_masked_tokens": total_masked,
+            "top1_correct":        total_top1,
+            "top5_correct":        total_top5,
+            "top1_accuracy":       float(total_top1 / total_masked),
+            "top5_accuracy":       float(total_top5 / total_masked),
+            "perplexity":          float(np.exp(-mean_lp)),
+            "_mean_log_prob":      mean_lp,   # kept for weighted combined PPL
+            "_snippets_skipped":   snippets_skipped,
+        }
+
+        lang_config = {
+            "language":     lang,
+            "data_file":    file_path,
+            "mask_ratio":   mask_ratio,
+            "top_k":        top_k,
+            "max_examples": max_ex,
+            "model":        model_path,
+            "max_length":   max_length,
+        }
+        save_lang_results(lang, metrics, snippets_skipped, lang_config, best_model_dir)
+        lang_metrics[lang] = metrics
+
+    # Combined metrics across all evaluated languages (weighted perplexity).
+    if lang_metrics:
+        all_top1   = sum(v["top1_correct"]        for v in lang_metrics.values())
+        all_top5   = sum(v["top5_correct"]        for v in lang_metrics.values())
+        all_masked = sum(v["total_masked_tokens"] for v in lang_metrics.values())
+        all_snips  = sum(v["snippets_evaluated"]  for v in lang_metrics.values())
+
+        weighted_lp = sum(
+            v["_mean_log_prob"] * v["total_masked_tokens"]
+            for v in lang_metrics.values()
+        ) / all_masked
+
+        combined: dict[str, Any] = {
+            "snippets_evaluated":  all_snips,
+            "total_masked_tokens": all_masked,
+            "top1_correct":        all_top1,
+            "top5_correct":        all_top5,
+            "top1_accuracy":       float(all_top1 / all_masked),
+            "top5_accuracy":       float(all_top5 / all_masked),
+            "perplexity":          float(np.exp(-weighted_lp)),
+        }
+        print_lang_results("Combined", combined)
+
+        # Save combined summary as a single JSON file matching the reference format.
+        combined_skipped = sum(v["_snippets_skipped"] for v in lang_metrics.values())
+        combined_config = {
+            "langs":        langs,
+            "data_files":   data_files,
+            "mask_ratio":   mask_ratio,
+            "top_k":        top_k,
+            "max_examples": max_ex,
+            "model":        model_path,
+            "max_length":   max_length,
+        }
+        combined_serializable = {
+            "snippets_evaluated":  combined["snippets_evaluated"],
+            "total_masked_tokens": combined["total_masked_tokens"],
+            "top1_accuracy":       float(combined["top1_accuracy"]),
+            "top5_accuracy":       float(combined["top5_accuracy"]),
+            "perplexity":          float(combined["perplexity"]),
+            "top1_correct":        int(combined["top1_correct"]),
+            "top5_correct":        int(combined["top5_correct"]),
+            "snippets_skipped":    combined_skipped,
+            "config":              combined_config,
+        }
+        summary_path = best_model_dir / "eval_summary.json"
+        best_model_dir.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w", encoding="utf-8") as fh:
+            json.dump(combined_serializable, fh, indent=2)
+        print(f"[eval] Combined summary saved → {summary_path}")
 
 
 if __name__ == "__main__":

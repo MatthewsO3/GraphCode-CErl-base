@@ -16,6 +16,7 @@ The model extends GraphCodeBERT's pre-training with a combined MLM + DFG edge-pr
 - [Quick Start](#quick-start)
 - [Full DFG-Based Inference](#full-dfg-based-inference)
 - [Repository Structure](#repository-structure)
+- [Pipeline (run.py)](#pipeline-runpy)
 - [Data Preprocessing](#data-preprocessing)
 - [Training](#training)
 - [Evaluation](#evaluation)
@@ -176,6 +177,7 @@ result = evaluator.evaluate_sample(sample, lang="cpp", mask_ratio=0.15, top_k=10
 
 ```
 GraphCode-CErl-base/
+├── run.py              # End-to-end pipeline: setup → preprocess → train → evaluate
 ├── model.py            # Dataset class, GraphCodeBERTWithEdgePrediction, and data collator
 ├── train.py            # Training loop, optimizer setup, checkpointing, and metrics logging
 ├── evaluate.py         # UnifiedMLMEvaluator — DFG-aware evaluation across all 5 languages
@@ -186,19 +188,102 @@ GraphCode-CErl-base/
 
 ---
 
+## Pipeline (run.py)
+
+`run.py` is the recommended entry point. It runs all four stages in order — **setup → preprocess → train → evaluate** — reading every value from `config.json`, with any key overridable via CLI flag.
+
+### Running the full pipeline
+
+```bash
+python run.py
+```
+
+### Overriding config values from the CLI
+
+Any value from `config.json` can be overridden directly. The override is written back into `config.json` before sub-scripts run, so all scripts see the updated value.
+
+```bash
+# Change batch size and number of epochs
+python run.py --batch_size 16 --epochs 3
+
+# Preprocess only C++ with a smaller sample count
+python run.py --lang cpp --max_samples 10000
+
+# Point at a different Erlang file and output directory
+python run.py --erlang_file data/my_erlang.jsonl --output_dir output/run_2
+```
+
+### Skipping or isolating stages
+
+```bash
+# Skip setup and preprocessing (e.g. data already prepared)
+python run.py --skip setup preprocess
+
+# Run only the evaluate stage
+python run.py --only evaluate
+
+# Run only training and evaluation
+python run.py --only train evaluate
+```
+
+### Dry run
+
+Print the exact subprocess commands that would be executed without running anything:
+
+```bash
+python run.py --dry_run
+```
+
+### Using a different config file
+
+```bash
+python run.py --config experiments/erlang_only.json
+```
+
+### CLI reference
+
+| Flag | Affects | Description |
+|---|---|---|
+| `--skip STAGE [STAGE ...]` | pipeline | Stages to skip: `setup`, `preprocess`, `train`, `evaluate` |
+| `--only STAGE [STAGE ...]` | pipeline | Run only these stages, skip all others |
+| `--dry_run` | pipeline | Print commands without executing |
+| `--config PATH` | pipeline | Path to config file (default: `config.json`) |
+| `--lang` | preprocess | Language to preprocess: `cpp`, `python`, `java`, `javascript`, `all` |
+| `--max_samples N` | preprocess | Max samples to collect per language |
+| `--data_file PATH` | train | Path to training JSONL |
+| `--output_dir PATH` | train | Output directory for checkpoints and metrics |
+| `--checkpoint_path PATH` | train | Resume from an existing checkpoint |
+| `--batch_size N` | train | Training batch size |
+| `--epochs N` | train | Maximum training epochs |
+| `--learning_rate F` | train | AdamW learning rate |
+| `--max_length N` | train | Maximum sequence length |
+| `--warmup_steps N` | train | LR scheduler warmup steps |
+| `--mlm_probability F` | train | Token masking probability |
+| `--validation_split F` | train | Fraction of data held out for validation |
+| `--weight_decay F` | train | AdamW weight decay |
+| `--early_stopping_patience N` | train | Epochs without improvement before stopping |
+| `--model PATH` | evaluate | Model ID or path (defaults to `output_dir/best_model`) |
+| `--mask_ratio F` | evaluate | Fraction of tokens to mask during evaluation |
+| `--top_k N` | evaluate | Top-k predictions to retrieve |
+| `--max_examples N` | evaluate | Max samples to evaluate per language |
+| `--langs LANG [...]` | evaluate | Languages to evaluate |
+| `--data_files PATH [...]` | evaluate | JSONL paths, parallel to `--langs` |
+
+---
+
 ## Data Preprocessing
 
 `preprocessing.py` downloads code from `codeparrot/github-code-clean` (streaming), extracts DFG edges via tree-sitter, tokenizes with the GraphCodeBERT tokenizer, and writes `.jsonl` files ready for training.
 
 ```bash
-# Preprocess C++ (default)
+# Preprocess a single language
 python preprocessing.py --lang cpp --max_samples 250000
 
-# Preprocess Python
-python preprocessing.py --lang python --max_samples 250000
-
-# Supported: cpp, python, java, javascript
+# Preprocess all supported languages in one pass
+python preprocessing.py --lang all --max_samples 250000
 ```
+
+Supported values for `--lang`: `cpp`, `python`, `java`, `javascript`, `all`.
 
 Output is written to `data/<lang>_processed.jsonl`. Each line is a JSON object with the following fields:
 
@@ -210,15 +295,26 @@ Output is written to `data/<lang>_processed.jsonl`. Each line is a JSON object w
 | `dataflow_graph` | List of DFG edges: `(var_name, use_pos, "comesFrom", [var_name], [def_pos])` |
 | `language` | Language string |
 
-> **Note:** Erlang training data was collected via a custom scraper and is not publicly available. For evaluation, provide your own `.jsonl` file following the schema above, or pass raw source code dicts with a `"code"` key.
-
 Samples are filtered to be between 100–10,000 characters and 3–500 lines, and must contain language-specific keywords (e.g. `std::`, `def `, `public `) to reduce noise.
+
+### Erlang data
+
+Erlang is not available on HuggingFace. Provide your own JSONL file and declare its path in `config.json` under `preprocess.erlang_file`. The file can contain either:
+
+- **Pre-tokenized records** with a `"code_tokens"` field — used as-is.
+- **Raw source records** with a `"code"` or `"source_code"` field — tokenized automatically using the GraphCodeBERT tokenizer. DFG extraction is skipped for Erlang (a warning is printed) since Tree-sitter Erlang may not be installed.
+
+### Training data merge
+
+After per-language preprocessing completes, `preprocessing.py` automatically merges the C++ and Erlang corpora into a single balanced, shuffled file at `data/train.jsonl`. Both corpora are truncated to the size of the smaller one so neither language dominates training.
+
+This step is skipped if `preprocess.erlang_file` is not set in `config.json`.
 
 ---
 
 ## Training
 
-Edit `config.json` to point `data_file` at your preprocessed `.jsonl` and `output_dir` at your desired output location, then run:
+Edit `config.json` to set `data_file` and `output_dir` under the `train` section, then run:
 
 ```bash
 python train.py
@@ -228,21 +324,21 @@ All config values can be overridden via CLI flags:
 
 ```bash
 python train.py \
-    --data_file data/cpp_processed.jsonl \
-    --output_dir output/cpp_run \
+    --data_file data/train.jsonl \
+    --output_dir output/cpp_erl_run \
     --epochs 6 \
     --batch_size 32 \
     --learning_rate 2e-5 \
     --max_length 256
 ```
 
-To resume from a checkpoint (e.g. a model previously trained on Erlang):
+To resume from a checkpoint:
 
 ```bash
 python train.py \
     --checkpoint_path output/erlang_run/best_model \
-    --data_file data/cpp_processed.jsonl \
-    --output_dir output/cpp_continued
+    --data_file data/train.jsonl \
+    --output_dir output/continued
 ```
 
 ### What gets saved
@@ -268,21 +364,33 @@ The loss is a sum of two terms:
 
 ## Evaluation
 
-Run evaluation on any combination of languages and data files:
-
 ```bash
 python evaluate.py --config config.json
 ```
 
-The `evaluate` section of `config.json` controls which model, languages, and data files are used. You can also point it at raw source code files — the evaluator will tokenize and extract DFG on the fly if `code_tokens` is absent from the JSONL.
+The evaluator reads `train.output_dir` from `config.json` and automatically uses `<output_dir>/best_model` as the model path. This can be overridden by setting `evaluate.model` explicitly.
 
-Expected JSONL format for evaluation (either works):
+### Output files
+
+Results are saved inside `<output_dir>/best_model/`:
+
+| File | Description |
+|---|---|
+| `eval_<lang>.jsonl` | Per-sample results + a final summary record for each language |
+| `eval_summary.jsonl` | One-line-per-language aggregated summary across all evaluated languages |
+
+Each `eval_<lang>.jsonl` contains one JSON record per evaluated sample (`"type": "sample"`) followed by a single summary record (`"type": "summary"`):
 
 ```jsonl
-# Pre-tokenized (faster)
-{"code_tokens": ["int", "Ġx", "Ġ=", "Ġ0", ";"], "dataflow_graph": [...]}
+{"type": "sample", "language": "cpp", "top1_hits": 1, "top5_hits": 1, "total": 3, "mean_log_prob": -0.412}
+{"type": "sample", "language": "cpp", "top1_hits": 2, "top5_hits": 3, "total": 4, "mean_log_prob": -0.287}
+{"type": "summary", "language": "cpp", "top1_accuracy": 0.885, "top5_accuracy": 0.942, "perplexity": 1.95, "total_masked_positions": 18423, "top1_hits": 16304, "top5_hits": 17354}
+```
 
-# Raw source (DFG extracted at eval time, requires tree-sitter)
+Expected JSONL format for evaluation input (either works):
+
+```jsonl
+{"code_tokens": ["int", "Ġx", "Ġ=", "Ġ0", ";"], "dataflow_graph": [...]}
 {"code": "int x = 0;"}
 ```
 
@@ -296,13 +404,21 @@ Metrics reported per language:
 
 ## Configuration Reference
 
-`config.json` has two top-level sections:
+`config.json` has three top-level sections:
+
+### `preprocess`
+
+| Key | Default | Description |
+|---|---|---|
+| `lang` | `"cpp"` | Language to preprocess: `cpp`, `python`, `java`, `javascript`, or `all` |
+| `max_samples` | `10` | Maximum samples to collect per language |
+| `erlang_file` | — | Path to a local Erlang JSONL file. Required to produce `data/train.jsonl` |
 
 ### `train`
 
 | Key | Default | Description |
 |---|---|---|
-| `data_file` | — | Path to `.jsonl` training data (relative to project root) |
+| `data_file` | — | Path to `.jsonl` training data |
 | `output_dir` | — | Output directory for checkpoints and metrics |
 | `checkpoint_path` | `""` | Path to a checkpoint to resume from (empty = start from base model) |
 | `batch_size` | `32` | Training batch size |
@@ -319,12 +435,50 @@ Metrics reported per language:
 
 | Key | Default | Description |
 |---|---|---|
-| `model` | `MatthewsO3/GraphCode-CErl-base` | HuggingFace model ID or local path |
+| `model` | *(derived from `train.output_dir`)* | HuggingFace model ID or local path. Defaults to `<output_dir>/best_model` |
 | `mask_ratio` | `0.15` | Fraction of tokens to mask during evaluation |
 | `top_k` | `10` | Top-k predictions to retrieve |
 | `max_examples` | `1000` | Maximum samples to evaluate per language |
 | `langs` | `[python, java, javascript, cpp, erlang]` | Languages to evaluate |
 | `data_files` | — | Parallel list of `.jsonl` paths, one per language |
+
+### Example `config.json`
+
+```json
+{
+  "preprocess": {
+    "lang": "all",
+    "max_samples": 250000,
+    "erlang_file": "data/erlang_data.jsonl"
+  },
+  "train": {
+    "data_file": "data/train.jsonl",
+    "output_dir": "output/graphcode_cerl",
+    "batch_size": 32,
+    "epochs": 6,
+    "learning_rate": 2e-5,
+    "max_length": 256,
+    "warmup_steps": 2000,
+    "mlm_probability": 0.15,
+    "validation_split": 0.15,
+    "weight_decay": 0.01,
+    "early_stopping_patience": 3
+  },
+  "evaluate": {
+    "mask_ratio": 0.15,
+    "top_k": 10,
+    "max_examples": 2500,
+    "langs": ["cpp", "erlang", "java", "python", "javascript"],
+    "data_files": [
+      "data/cpp_processed.jsonl",
+      "data/erlang_data.jsonl",
+      "data/java_processed.jsonl",
+      "data/python_processed.jsonl",
+      "data/javascript_processed.jsonl"
+    ]
+  }
+}
+```
 
 ---
 
