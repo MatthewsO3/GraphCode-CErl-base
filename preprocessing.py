@@ -294,27 +294,94 @@ def stream_dataset(lang: str, output_file: str, max_samples: int) -> None:
                 pbar.update(1)
 
 
+def load_config(config_path: str = "config.json") -> dict:
+    """Load the preprocessing section from ``config.json``.
+
+    Returns an empty dict when the file does not exist or contains no
+    ``"preprocess"`` key, so callers can safely use ``.get()`` on the result.
+
+    :param config_path: Path to the JSON config file.
+    :returns: The ``"preprocess"`` sub-dict, or ``{}`` if absent.
+    """
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    with path.open() as fh:
+        return json.load(fh).get("preprocess", {})
+
+
+def resolve_langs(lang: str) -> list[str]:
+    """Expand the language argument into a list of language identifiers.
+
+    Passing ``"all"`` returns every language present in
+    :data:`LANGUAGE_CONFIG`.  Any other value is returned as a single-element
+    list after lower-casing.
+
+    :param lang: A language identifier (``"cpp"``, ``"python"``, ``"java"``,
+        ``"javascript"``) or the special value ``"all"``.
+    :returns: Ordered list of language identifiers to preprocess.
+    """
+    if lang.lower() == "all":
+        return list(LANGUAGE_CONFIG.keys())
+    return [lang.lower()]
+
+
 def main() -> None:
-    """Parse CLI arguments and run the dataset preprocessing pipeline.
+    """Parse CLI arguments, merge config.json defaults, and run preprocessing.
 
-    Accepts two arguments:
+    Resolution order (highest priority first):
 
-    * ``--lang`` *(default: ``"cpp"``)*: the target programming language.
-    * ``--max_samples`` *(default: ``10``)*: maximum number of samples to
-      write.
+    1. CLI flags (``--lang``, ``--max_samples``, ``--config``)
+    2. ``config.json`` → ``"preprocess"`` section
+    3. Built-in defaults (``lang = "cpp"``, ``max_samples = 10``)
 
-    Output is written to ``data/<lang>_processed.jsonl``; the ``data/``
-    directory is created if it does not already exist.
+    When ``lang`` is ``"all"``, every language in :data:`LANGUAGE_CONFIG`
+    is preprocessed in sequence.  Output files are written to
+    ``data/<lang>_processed.jsonl``; the ``data/`` directory is created if it
+    does not already exist.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--lang", type=str, default="cpp", help="cpp, python, java, or javascript"
+        "--lang",
+        type=str,
+        default=None,
+        help="Language to preprocess: cpp | python | java | javascript | all",
     )
-    parser.add_argument("--max_samples", type=int, default=10)
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Maximum number of accepted samples to write per language.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.json",
+        metavar="PATH",
+        help="Path to config.json (default: config.json).",
+    )
     args = parser.parse_args()
-    output_path = f"data/{args.lang}_processed.jsonl"
+
+    cfg = load_config(args.config)
+
+    # Merge: CLI > config.json > built-in default
+    lang = args.lang or cfg.get("lang", "cpp")
+    max_samples = (
+        args.max_samples if args.max_samples is not None else cfg.get("max_samples", 10)
+    )
+
+    langs = resolve_langs(lang)
     os.makedirs("data", exist_ok=True)
-    stream_dataset(args.lang, output_path, args.max_samples)
+
+    print(f"Languages to preprocess : {langs}")
+    print(f"Max samples per language: {max_samples}")
+
+    for lg in langs:
+        output_path = f"data/{lg}_processed.jsonl"
+        print(f"\n--- Preprocessing {lg} → {output_path} ---")
+        stream_dataset(lg, output_path, max_samples)
+
+    print("\nPreprocessing complete.")
 
 
 if __name__ == "__main__":
