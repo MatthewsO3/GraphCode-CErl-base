@@ -22,7 +22,7 @@ python code_search.py index --erlang "/path/to/erl" --cpp "/path/to/cpp" --pytho
 python code_search.py index --python "/path/to/py_repo" --model "/path/to/best_model" --output corpus.jsonl --index corpus_index.pt
 
 # Search against a pre-built corpus
-python code_search.py search --model "/path/to/best_model" --jsonl corpus.jsonl --index corpus_index.pt --top 5
+python code_search.py search --model "path/to/model" --jsonl corpus.jsonl --index corpus_index.pt --top 5
 """
 
 
@@ -945,30 +945,43 @@ def _load_model_and_tokenizer(model_path: str):
     return tokenizer, model, device
 
 
+def _mean_pool(last_hidden_state, attention_mask):
+    """
+    Mean-pool token embeddings, masking out padding.
+
+    Must match model.py's mean_pooling() exactly — the model was trained
+    with mean pooling (+ L2 normalization), not CLS-token pooling.
+    """
+    mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+    return (last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+
+
 def _embed_records(
     records: List[Dict],
     tokenizer,
     model,
     device,
     batch_size: int = 32,
-    max_length: int = 512,
+    max_length: int = 256,
 ) -> "torch.Tensor":
     """
-    Encode *code* + *docstring* for every record and return a float32 tensor
-    of shape (N, hidden_size).
+    Encode *code only* for every record and return a float32 tensor of shape
+    (N, hidden_size), mean-pooled and L2-normalized.
 
-    The input sequence is:  `<s> docstring </s> </s> code </s>`
-    (standard RoBERTa NLI / bi-encoder layout).
+    Training (train.py) never concatenated docstring + code into one
+    sequence — it ran the shared encoder separately on `code` (truncated to
+    code_len=256) to get the code-branch vector, and separately on a
+    docstring (truncated to nl_len=128) to get the NL-branch vector, then
+    compared the two via dot product. To match that, indexing here embeds
+    `code` alone, at the same 256-token length used in training.
     """
     import torch
+    import torch.nn.functional as F
 
     all_embeddings: List["torch.Tensor"] = []
     for start in range(0, len(records), batch_size):
         batch = records[start : start + batch_size]
-        texts = [
-            (r.get("docstring") or "") + " " + (r.get("code") or "")
-            for r in batch
-        ]
+        texts = [r.get("code") or "" for r in batch]
         enc = tokenizer(
             texts,
             padding=True,
@@ -979,9 +992,9 @@ def _embed_records(
         enc = {k: v.to(device) for k, v in enc.items()}
         with torch.no_grad():
             out = model(**enc)
-        # CLS-token representation
-        cls_emb = out.last_hidden_state[:, 0, :]  # (batch, H)
-        all_embeddings.append(cls_emb.cpu())
+        emb = _mean_pool(out.last_hidden_state, enc["attention_mask"])
+        emb = F.normalize(emb, p=2, dim=1)
+        all_embeddings.append(emb.cpu())
         log.info(
             "Embedded %d / %d records",
             min(start + batch_size, len(records)),
@@ -997,9 +1010,7 @@ def _build_index(
 
     tokenizer, model, device = _load_model_and_tokenizer(model_path)
     embeddings = _embed_records(records, tokenizer, model, device, batch_size)
-    # Normalise for cosine similarity via dot-product
-    norms = embeddings.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    embeddings = embeddings / norms
+    # Already L2-normalized inside _embed_records — no extra normalization needed.
 
     index_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"embeddings": embeddings}, str(index_path))
@@ -1046,8 +1057,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     else:
         log.info("Index not found – building now (this may take a while) …")
         embeddings = _embed_records(records, tokenizer, model, device, args.batch_size)
-        norms = embeddings.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        embeddings = embeddings / norms
+        # Already L2-normalized inside _embed_records — no extra normalization needed.
         torch.save({"embeddings": embeddings}, str(index_path))
         log.info("Index saved to %s", index_path)
 
@@ -1084,21 +1094,27 @@ def _search(
     device,
     top_k: int,
 ) -> List[Tuple[float, Dict]]:
-    """Encode the query and return the top-k (score, record) pairs."""
+    """
+    Encode the query and return the top-k (score, record) pairs.
+
+    The query is treated as the NL branch (same as docstrings at training
+    time): mean-pooled, L2-normalized, truncated to nl_len=128.
+    """
     import torch
+    import torch.nn.functional as F
 
     enc = tokenizer(
         query,
         padding=True,
         truncation=True,
-        max_length=64,
+        max_length=128,
         return_tensors="pt",
     )
     enc = {k: v.to(device) for k, v in enc.items()}
     with torch.no_grad():
         out = model(**enc)
-    q_vec = out.last_hidden_state[:, 0, :]       # (1, H)
-    q_vec = q_vec / q_vec.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    q_vec = _mean_pool(out.last_hidden_state, enc["attention_mask"])
+    q_vec = F.normalize(q_vec, p=2, dim=1)
 
     scores = (embeddings @ q_vec.T).squeeze(1)   # (N,)
     top_indices = scores.topk(min(top_k, len(records))).indices.tolist()
