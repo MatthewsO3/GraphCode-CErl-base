@@ -72,11 +72,12 @@ def step_deps():
     run_silent([str(VENV_PIP), "install", "--upgrade", "pip"])
 
     required = [
-        "torch",
+        "torch==2.7",
         "transformers",
         "tree-sitter",
         "tree-sitter-cpp",
         "tree-sitter-python",
+        "ranx",
     ]
     run([str(VENV_PIP), "install"] + required)
     ok("Core dependencies installed")

@@ -16,21 +16,29 @@ Usage examples
 python code_search.py index --repo "/path/to/mixed_repo" --model "/path/to/best_model" --output corpus.jsonl --index corpus_index.pt
 
 # Language-specific flags (combinable; --repo is additive with the others)
-python code_search.py index --erlang "/path/to/erl" --cpp "/path/to/cpp" --python "/path/to/py" --model "/path/to/best_model" --output corpus.jsonl --index corpus_index.pt
+python code_search.py index --erlang "..." --cpp "..." --python "..." --model "MatthewsO3/GraphCode-CErl-codesearch" --output three_lang.jsonl --index three_lang_index.pt
 
 # Python-only
-python code_search.py index --python "/path/to/py_repo" --model "/path/to/best_model" --output corpus.jsonl --index corpus_index.pt
+python code_search.py index --python "..." --model "MatthewsO3/GraphCode-CErl-codesearch" --output py.jsonl --index py_index.pt
 
 # Search against a pre-built corpus
-python code_search.py search --model "path/to/model" --jsonl corpus.jsonl --index corpus_index.pt --top 5
+python code_search.py search --model "MatthewsO3/GraphCode-CErl-codesearch" --jsonl corpus.jsonl --index corpus_index.pt --top 5
+
+# lenient: any graded function entry counts as valid gold
+python code_search.py eval --model "MatthewsO3/GraphCode-CErl-codesearch" --jsonl corpus.jsonl --index corpus_index.pt --queries example.jsonl --min-relevance 1 --output eval_lenient.jsonl
+
+# strict: only relevance=5 function entries count
+python code_search.py eval --model "MatthewsO3/GraphCode-CErl-codesearch" --jsonl corpus.jsonl --index corpus_index.pt --queries example.jsonl --min-relevance 5 --output eval_strict.jsonl
 """
 
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -1021,12 +1029,14 @@ def _build_index(
 #  SECTION 7 – SEARCH mode
 # ═══════════════════════════════════════════════════════════════════════════
 
-def cmd_search(args: argparse.Namespace) -> None:
+def _load_corpus_and_index(args: argparse.Namespace):
     """
-    Interactive semantic code search.
+    Shared loader used by both `search` and `eval`.
 
-    On first run (or when --index does not exist) the embedding index is built
-    from the JSONL and saved for future use.
+    Loads the JSONL corpus, the fine-tuned model/tokenizer, and the embedding
+    index (building + caching it on demand if it does not exist yet).
+
+    Returns (records, embeddings, tokenizer, model, device).
     """
     import torch
 
@@ -1062,6 +1072,17 @@ def cmd_search(args: argparse.Namespace) -> None:
         log.info("Index saved to %s", index_path)
 
     embeddings = embeddings.to(device)
+    return records, embeddings, tokenizer, model, device
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    """
+    Interactive semantic code search.
+
+    On first run (or when --index does not exist) the embedding index is built
+    from the JSONL and saved for future use.
+    """
+    records, embeddings, tokenizer, model, device = _load_corpus_and_index(args)
 
     # ── interactive search loop ───────────────────────────────────────
     top_k = args.top
@@ -1151,6 +1172,272 @@ def _print_hits(hits: List[Tuple[float, Dict]]) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  SECTION 7b – EVAL mode (batch queries against a query/good-answer dataset)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Eval dataset format (one JSON object per line, .jsonl):
+#   {
+#     "question": "...",
+#     "expectedTypes": {...},                 # unused for now
+#     "results": {
+#         "record:<path>:<Struct>.<field>": <relevance 1-5>,
+#         "function:<path>:<func_name>/<arity>": <relevance 1-5>,
+#         "tr:<TICKET-ID>": <relevance 1-5>,
+#         "mom:<Something>::<field>": <relevance 1-5>,
+#         ...
+#     }
+#   }
+#
+# NOTE: for now we only score against the "function:" entries in `results`
+# (per current scope) — "record:", "tr:", and "mom:" entries are parsed but
+# ignored. This can be extended later once those doc types have a
+# corresponding representation in the indexed corpus.
+#
+# Matching is done on (path, func_name); the /<arity> suffix is dropped since
+# the corpus schema built by `index` mode doesn't track arity, so a function
+# with multiple arities in the same file is treated as a single doc. This is
+# a pragmatic simplification — flag if you need arity-aware matching later.
+
+def _rank_and_score_all(
+    query: str,
+    embeddings: "torch.Tensor",
+    tokenizer,
+    model,
+    device,
+):
+    """Encode *query* and return a 1-D tensor of similarity scores, one per
+    corpus record, in the same order as `embeddings`."""
+    import torch
+    import torch.nn.functional as F
+
+    enc = tokenizer(
+        query,
+        padding=True,
+        truncation=True,
+        max_length=128,
+        return_tensors="pt",
+    )
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with torch.no_grad():
+        out = model(**enc)
+    q_vec = _mean_pool(out.last_hidden_state, enc["attention_mask"])
+    q_vec = F.normalize(q_vec, p=2, dim=1)
+    return (embeddings @ q_vec.T).squeeze(1).cpu()  # (N,)
+
+
+def _norm_path(p: str) -> str:
+    return p.replace("\\", "/").strip().lstrip("./")
+
+
+def _parse_function_gold_key(raw_key: str):
+    """
+    Parse a "function:<path>:<func_name>/<arity>" results key.
+    Returns (path, func_name) or None if it doesn't match the expected shape.
+    """
+    if not raw_key.startswith("function:"):
+        return None
+    rest = raw_key[len("function:"):]
+    if ":" not in rest:
+        return None
+    path, func_spec = rest.rsplit(":", 1)
+    func_name = func_spec.rsplit("/", 1)[0] if "/" in func_spec else func_spec
+    return _norm_path(path), func_name
+
+
+def _load_function_eval_dataset(path: Path, min_relevance: int = 1) -> List[Dict]:
+    """
+    Load the {"question", "expectedTypes", "results"} JSONL eval format and
+    reduce each row's `results` to only its "function:" entries, keyed by
+    normalized (path, func_name).
+
+    min_relevance: drop function-type gold entries with relevance below this
+    (e.g. min_relevance=5 keeps only entries explicitly graded as the single
+    correct answer; min_relevance=1 keeps every graded function entry).
+
+    Returns a list of {"query_id", "question", "gold": {(path, func_name): relevance}}.
+    """
+    rows: List[Dict] = []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+
+    dataset = []
+    total_gold_entries = 0
+    dropped_below_threshold = 0
+    for i, row in enumerate(rows):
+        question = row.get("question")
+        results = row.get("results", {})
+        if not question or not isinstance(results, dict):
+            log.warning("Skipping row %d — missing 'question' or 'results'.", i)
+            continue
+
+        gold: Dict[Tuple[str, str], int] = {}
+        for raw_key, relevance in results.items():
+            parsed = _parse_function_gold_key(raw_key)
+            if parsed is None:
+                continue  # not a "function:" entry — ignored for now
+            total_gold_entries += 1
+            if relevance < min_relevance:
+                dropped_below_threshold += 1
+                continue
+            path_key, func_name = parsed
+            # Keep the max relevance if the same (path, func_name) appears twice.
+            gold[(path_key, func_name)] = max(relevance, gold.get((path_key, func_name), 0))
+
+        dataset.append({"query_id": f"q{i}", "question": question, "gold": gold})
+
+    n_with_gold = sum(1 for d in dataset if d["gold"])
+    kept = total_gold_entries - dropped_below_threshold
+    log.info(
+        "Loaded %d queries (%d have at least one 'function:' gold entry at or above "
+        "min_relevance=%d; %d/%d total function-type gold entries kept, %d dropped "
+        "for being below the threshold).",
+        len(dataset), n_with_gold, min_relevance, kept, total_gold_entries, dropped_below_threshold,
+    )
+    return dataset
+
+
+def _build_function_doc_index(records: List[Dict]) -> Dict[Tuple[str, str], List[int]]:
+    """Map normalized (path, func_name) -> list of record indices sharing it."""
+    idx: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    for i, rec in enumerate(records):
+        key = (_norm_path(rec.get("path", "")), rec.get("func_name", ""))
+        idx[key].append(i)
+    return idx
+
+
+def _resolve_gold_doc_ids(
+    gold: Dict[Tuple[str, str], int],
+    doc_index: Dict[Tuple[str, str], List[int]],
+) -> Tuple[Dict[str, int], int]:
+    """
+    Resolve (path, func_name) gold keys to doc ids that exist in the corpus.
+
+    Tries an exact (path, func_name) match first; falls back to a path
+    suffix match (handles cases where the dataset's path root differs
+    slightly from the corpus's) if the exact match fails.
+
+    Returns (resolved {doc_id: relevance}, count_unresolved).
+    """
+    # Build a func_name -> [(corpus_path, doc_id)] lookup lazily for fallback.
+    resolved: Dict[str, int] = {}
+    unresolved = 0
+
+    # Fallback index: func_name -> list of (corpus_path, key)
+    by_func_name: Dict[str, List[Tuple[str, Tuple[str, str]]]] = defaultdict(list)
+    for key in doc_index:
+        by_func_name[key[1]].append((key[0], key))
+
+    for (gold_path, func_name), relevance in gold.items():
+        key = (gold_path, func_name)
+        match_key = None
+        if key in doc_index:
+            match_key = key
+        else:
+            # Fallback: same func_name, path is a suffix/prefix match.
+            for corpus_path, candidate_key in by_func_name.get(func_name, []):
+                if corpus_path.endswith(gold_path) or gold_path.endswith(corpus_path):
+                    match_key = candidate_key
+                    break
+
+        if match_key is None:
+            unresolved += 1
+            continue
+
+        doc_id = f"{match_key[0]}::{match_key[1]}"
+        resolved[doc_id] = max(relevance, resolved.get(doc_id, 0))
+
+    return resolved, unresolved
+
+
+def cmd_eval(args: argparse.Namespace) -> None:
+    """
+    Batch-evaluate the model against a query/good-answer dataset, scoring
+    against the "function:" entries only, using ranx for IR metrics.
+    """
+    try:
+        from ranx import Qrels, Run, evaluate as ranx_evaluate
+    except ImportError:
+        log.error(
+            "The 'ranx' package is required for eval mode. Install it with:\n"
+            "    pip install ranx --break-system-packages"
+        )
+        sys.exit(1)
+
+    records, embeddings, tokenizer, model, device = _load_corpus_and_index(args)
+    doc_index = _build_function_doc_index(records)
+
+    # doc_id -> list of record indices (for scoring: take max score if a
+    # (path, func_name) maps to more than one record, e.g. distinct arities).
+    doc_id_to_indices: Dict[str, List[int]] = {
+        f"{k[0]}::{k[1]}": idxs for k, idxs in doc_index.items()
+    }
+
+    queries_path = Path(args.queries)
+    if not queries_path.exists():
+        log.error("Eval dataset not found: %s", queries_path)
+        sys.exit(1)
+    dataset = _load_function_eval_dataset(queries_path, min_relevance=args.min_relevance)
+    if args.limit:
+        dataset = dataset[: args.limit]
+
+    metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
+
+    qrels_dict: Dict[str, Dict[str, int]] = {}
+    run_dict: Dict[str, Dict[str, float]] = {}
+    per_query_rows = []
+    total_unresolved = 0
+    skipped_no_gold = 0
+
+    for row in dataset:
+        resolved_gold, unresolved = _resolve_gold_doc_ids(row["gold"], doc_index)
+        total_unresolved += unresolved
+
+        if not resolved_gold:
+            skipped_no_gold += 1
+            per_query_rows.append({"query_id": row["query_id"], "question": row["question"], "note": "no resolvable function gold"})
+            continue
+
+        scores = _rank_and_score_all(row["question"], embeddings, tokenizer, model, device)
+        run_scores: Dict[str, float] = {}
+        for doc_id, idxs in doc_id_to_indices.items():
+            run_scores[doc_id] = max(float(scores[i]) for i in idxs)
+
+        qrels_dict[row["query_id"]] = resolved_gold
+        run_dict[row["query_id"]] = run_scores
+        per_query_rows.append({"query_id": row["query_id"], "question": row["question"], "gold": resolved_gold})
+
+    evaluated = len(qrels_dict)
+    print("\n" + "═" * 60)
+    print("  Code Search — Evaluation Results (function-type gold only)")
+    print(f"  Corpus: {len(records)} functions  |  min_relevance={args.min_relevance}")
+    print(f"  Queries: {len(dataset)} total, {evaluated} evaluated, "
+          f"{skipped_no_gold} skipped (no 'function:' gold resolvable in corpus)")
+    if total_unresolved:
+        print(f"  Note: {total_unresolved} individual 'function:' gold references across "
+              f"all queries could not be matched to a corpus record (path/name mismatch?).")
+    print("═" * 60)
+
+    if evaluated:
+        qrels = Qrels(qrels_dict)
+        run = Run(run_dict)
+        results = ranx_evaluate(qrels, run, metrics=metrics)
+        for m in metrics:
+            print(f"  {m:<12s}: {results[m]:.4f}")
+    else:
+        print("  No queries could be evaluated — check path/func_name matching above.")
+    print("═" * 60 + "\n")
+
+    if args.output:
+        out_path = Path(args.output)
+        with out_path.open("w", encoding="utf-8") as fh:
+            for r in per_query_rows:
+                fh.write(json.dumps(r) + "\n")
+        log.info("Per-query results written to %s", out_path)
+
+
 #  SECTION 8 – CLI
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1262,6 +1549,77 @@ def build_parser() -> argparse.ArgumentParser:
         help="Batch size when building index on demand (default: 32).",
     )
 
+    # ── eval ───────────────────────────────────────────────────────────
+    ev = sub.add_parser(
+        "eval",
+        help="Batch-evaluate the model against a query/good-answer dataset "
+             "(reports Recall@k and MRR; no interactive prompt).",
+    )
+    ev.add_argument(
+        "--model",
+        metavar="DIR",
+        required=True,
+        help="Fine-tuned GraphCodeBERT model directory.",
+    )
+    ev.add_argument(
+        "--jsonl",
+        metavar="FILE",
+        default="corpus.jsonl",
+        help="Corpus JSONL file (default: corpus.jsonl).",
+    )
+    ev.add_argument(
+        "--index",
+        metavar="FILE",
+        default="index.pt",
+        help="Embedding index .pt file (default: index.pt). Built on demand.",
+    )
+    ev.add_argument(
+        "--queries",
+        metavar="FILE",
+        required=True,
+        help="Query/gold dataset (.jsonl), one JSON object per line: "
+             '{"question": ..., "results": {"function:<path>:<name>/<arity>": <relevance>, ...}}. '
+             "Only 'function:' entries in results are scored currently.",
+    )
+    ev.add_argument(
+        "--metrics",
+        metavar="M1,M2,...",
+        default="mrr,recall@5,recall@10,ndcg@5,ndcg@10,precision@5",
+        help="Comma-separated ranx metric names (default: "
+             "mrr,recall@5,recall@10,ndcg@5,ndcg@10,precision@5).",
+    )
+    ev.add_argument(
+        "--min-relevance",
+        metavar="N",
+        type=int,
+        default=1,
+        help="Drop function-type gold entries graded below this (1-5) before "
+             "scoring. Default 1 keeps every graded function entry. Use 5 for "
+             "a strict 'only the single correct answer counts' mode — note "
+             "this may skip many queries whose graded-5 answer is a "
+             "record/tr/mom entry rather than a function.",
+    )
+    ev.add_argument(
+        "--limit",
+        metavar="N",
+        type=int,
+        default=None,
+        help="Only evaluate the first N queries (useful for a quick smoke test).",
+    )
+    ev.add_argument(
+        "--output",
+        metavar="FILE",
+        default=None,
+        help="Optional path to write per-query rank results as JSONL.",
+    )
+    ev.add_argument(
+        "--batch-size",
+        metavar="N",
+        type=int,
+        default=32,
+        help="Batch size when building index on demand (default: 32).",
+    )
+
     return p
 
 
@@ -1273,6 +1631,8 @@ def main() -> None:
         cmd_index(args)
     elif args.command == "search":
         cmd_search(args)
+    elif args.command == "eval":
+        cmd_eval(args)
     else:
         parser.print_help()
         sys.exit(1)
