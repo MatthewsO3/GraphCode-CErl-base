@@ -1286,7 +1286,12 @@ def _load_function_eval_dataset(path: Path, min_relevance: int = 1) -> List[Dict
             # Keep the max relevance if the same (path, func_name) appears twice.
             gold[(path_key, func_name)] = max(relevance, gold.get((path_key, func_name), 0))
 
-        dataset.append({"query_id": f"q{i}", "question": question, "gold": gold})
+        dataset.append({
+            "query_id": f"q{i}",
+            "question": question,
+            "gold": gold,
+            "raw_gold": results,
+        })
 
     n_with_gold = sum(1 for d in dataset if d["gold"])
     kept = total_gold_entries - dropped_below_threshold
@@ -1390,6 +1395,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
     per_query_rows = []
     total_unresolved = 0
     skipped_no_gold = 0
+    TOP_N = 5
 
     for row in dataset:
         resolved_gold, unresolved = _resolve_gold_doc_ids(row["gold"], doc_index)
@@ -1397,17 +1403,46 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
         if not resolved_gold:
             skipped_no_gold += 1
-            per_query_rows.append({"query_id": row["query_id"], "question": row["question"], "note": "no resolvable function gold"})
+            per_query_rows.append({
+                "query": row["question"],
+                "top5": [],
+                "gold": row["raw_gold"],
+                "note": "no resolvable function gold",
+            })
             continue
 
         scores = _rank_and_score_all(row["question"], embeddings, tokenizer, model, device)
+
+        # doc_id -> best score, and doc_id -> record index achieving that score
+        # (needed so top-5 can be rendered with real path/func_name/code).
         run_scores: Dict[str, float] = {}
+        best_idx: Dict[str, int] = {}
         for doc_id, idxs in doc_id_to_indices.items():
-            run_scores[doc_id] = max(float(scores[i]) for i in idxs)
+            best_i = max(idxs, key=lambda i: float(scores[i]))
+            run_scores[doc_id] = float(scores[best_i])
+            best_idx[doc_id] = best_i
+
+        top_doc_ids = sorted(run_scores, key=run_scores.get, reverse=True)[:TOP_N]
+        top5 = []
+        for rank, doc_id in enumerate(top_doc_ids, start=1):
+            rec = records[best_idx[doc_id]]
+            top5.append({
+                "rank": rank,
+                "score": run_scores[doc_id],
+                "path": rec.get("path", ""),
+                "func_name": rec.get("func_name", ""),
+                "repo": rec.get("repo", ""),
+                "language": rec.get("language", ""),
+            })
 
         qrels_dict[row["query_id"]] = resolved_gold
         run_dict[row["query_id"]] = run_scores
-        per_query_rows.append({"query_id": row["query_id"], "question": row["question"], "gold": resolved_gold})
+        per_query_rows.append({
+            "query_id": row["query_id"],
+            "query": row["question"],
+            "top5": top5,
+            "gold": row["raw_gold"],
+        })
 
     evaluated = len(qrels_dict)
     print("\n" + "═" * 60)
@@ -1420,15 +1455,28 @@ def cmd_eval(args: argparse.Namespace) -> None:
               f"all queries could not be matched to a corpus record (path/name mismatch?).")
     print("═" * 60)
 
+    per_query_metrics: Dict[str, Dict[str, float]] = {}
     if evaluated:
         qrels = Qrels(qrels_dict)
         run = Run(run_dict)
-        results = ranx_evaluate(qrels, run, metrics=metrics)
+        # save_results_in_run=True (default) makes ranx stash each query's
+        # individual metric score on `run`, keyed by metric then query_id —
+        # that's what lets us attach per-query metrics below, not just the
+        # aggregate mean.
+        results = ranx_evaluate(qrels, run, metrics=metrics, save_results_in_run=True)
         for m in metrics:
             print(f"  {m:<12s}: {results[m]:.4f}")
+        for m in metrics:
+            for qid, score in run.scores.get(m, {}).items():
+                per_query_metrics.setdefault(qid, {})[m] = float(score)
     else:
         print("  No queries could be evaluated — check path/func_name matching above.")
     print("═" * 60 + "\n")
+
+    for r in per_query_rows:
+        qid = r.pop("query_id", None)
+        if qid is not None and qid in per_query_metrics:
+            r["metrics"] = per_query_metrics[qid]
 
     if args.output:
         out_path = Path(args.output)
