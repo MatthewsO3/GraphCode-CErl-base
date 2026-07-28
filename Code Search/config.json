@@ -2,7 +2,7 @@
     "train": {
         "model_path": "MatthewsO3/GraphCode-CErl-base",
         "train_file": "data/train.jsonl",
-        "output_dir": "cs_models/all_train/",
+        "output_dir": "models/erlang_train/",
         "batch_size": 32,
         "epochs": 10,
         "lr": 2e-5,

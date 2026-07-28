@@ -8,6 +8,53 @@ from datasets import load_dataset
 import re
 from itertools import islice
 
+CODE_STRING = "sourcecode"
+DOC_STRING = "docstring"
+
+def load_erlang_snippets(path: str) -> List[Dict]:
+    """
+    Load Erlang code/docstring pairs from a JSON file that uses the
+    {'sourcecode': ..., 'docstring': ...} schema, and normalize them to
+    this pipeline's {'code', 'positive', 'language'} schema.
+
+    Accepts either a single JSON array of objects or one JSON object per
+    line (JSONL) — whichever the file turns out to be.
+    """
+    raw_text = Path(path).read_text(encoding="utf-8")
+    raw_records: List[Dict] = []
+
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, list):
+            raw_records = parsed
+        elif isinstance(parsed, dict):
+            raw_records = [parsed]
+    except json.JSONDecodeError:
+        pass
+
+    if not raw_records:
+        for line_no, line in enumerate(raw_text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw_records.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"  Skipping malformed line {line_no} in {path}")
+
+    records: List[Dict] = []
+    skipped = 0
+    for rec in raw_records:
+        code = rec.get(CODE_STRING)
+        docstring = rec.get(DOC_STRING)
+        if not code or not docstring:
+            skipped += 1
+            continue
+        records.append({"code": code, "positive": docstring, "language": "erlang"})
+
+    print(f"Loaded {len(records)} Erlang records from {path} ({skipped} skipped for missing sourcecode/docstring)")
+    return records
+
 
 class CodeSearchDataset:
     def __init__(self, jsonl_path: str, seed: int = 42):
@@ -303,20 +350,30 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Create training data with hard negatives.")
-    parser.add_argument("--cpp", type=str, default=None, help="Path to existing C++ JSONL file. If not provided, downloads from Hugging Face.")
-    parser.add_argument("--erlang", type=str, default=None, help="Path to Erlang JSONL file (with 'code', 'positive', 'language' columns).")
+    parser.add_argument("--cpp", type=str, default=None, help="Path to existing C++ JSONL file (with 'code'/'positive' columns).")
+    parser.add_argument("--download_cpp", action="store_true", help="Download C++ data from Hugging Face if --cpp isn't given. Omit both to train on Erlang alone.")
+    parser.add_argument("--erlang", type=str, default=None, help="Path to your Erlang JSON file (JSON array or JSONL) using 'sourcecode' and 'docstring' fields.")
+    parser.add_argument("--make_distractors", action="store_true", help="Also build data/distractors.jsonl from the held-out HF C++ split (skipped by default).")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent.absolute()
     data_dir = script_dir / "data"
     data_dir.mkdir(exist_ok=True)
 
-    # Step 1: Get C++ records
+    # Step 1: Erlang records — this run's primary/only source, in your
+    # {'sourcecode', 'docstring'} schema, normalized to {'code', 'positive', 'language'}.
+    erlang_records = []
+    if args.erlang:
+        print(f"\n=== Loading Erlang dataset: {args.erlang} ===")
+        erlang_records = load_erlang_snippets(args.erlang)
+
+    # Step 2: C++ is now opt-in only — no more silent download by default.
+    cpp_records = []
     if args.cpp:
         print(f"\n=== Using existing C++ JSONL file: {args.cpp} ===")
         with open(args.cpp, 'r') as f:
             cpp_records = [json.loads(line) for line in f if line.strip()]
-    else:
+    elif args.download_cpp:
         print("\n=== Downloading C++ dataset from Hugging Face ===")
         cpp_path = data_dir / "cpp.jsonl"
         CodeSearchDataset.create_dataset_from_source(
@@ -326,28 +383,19 @@ if __name__ == "__main__":
         )
         with open(cpp_path, 'r') as f:
             cpp_records = [json.loads(line) for line in f if line.strip()]
+    else:
+        print("\n=== No --cpp / --download_cpp given: training on Erlang only ===")
 
-    # Tag language if not already present
     for r in cpp_records:
         r.setdefault("language", "cpp")
 
-    # Step 2: Optionally merge with Erlang
-    if args.erlang:
-        print(f"\n=== Loading Erlang dataset: {args.erlang} ===")
-        with open(args.erlang, 'r') as f:
-            erlang_records = [json.loads(line) for line in f if line.strip()]
-        for r in erlang_records:
-            r.setdefault("language", "erlang")
-
-        print(f"C++ records:    {len(cpp_records)}")
-        print(f"Erlang records: {len(erlang_records)}")
-
-        combined = cpp_records + erlang_records
-        random.shuffle(combined)
-        print(f"Combined total: {len(combined)} (shuffled)")
-    else:
-        print("\n=== No Erlang data provided, using C++ only ===")
-        combined = cpp_records
+    combined = erlang_records + cpp_records
+    if not combined:
+        raise SystemExit("No training data assembled — provide --erlang and/or --cpp/--download_cpp.")
+    random.shuffle(combined)
+    print(f"\nErlang records: {len(erlang_records)}")
+    print(f"C++ records:    {len(cpp_records)}")
+    print(f"Combined total: {len(combined)} (shuffled)")
 
     # Step 3: Write combined source to disk and build dataset
     combined_path = data_dir / "combined_source.jsonl"
@@ -367,14 +415,16 @@ if __name__ == "__main__":
         hard_negative_ratio=0.6
     )
 
-    # Step 5: Create distractors (always from HuggingFace C++ held-out set)
-    print("\n=== Creating distractors ===")
-    distractors_path = data_dir / "distractors.jsonl"
-    CodeSearchDataset.create_distractors(
-        str(distractors_path),
-        num_distractors=1147,
-        start_idx=8650
-    )
+    # Step 5: Distractors (opt-in — this always sources from the HF C++ held-out
+    # set, so it only makes sense if you actually want C++ distractors)
+    if args.make_distractors:
+        print("\n=== Creating distractors ===")
+        distractors_path = data_dir / "distractors.jsonl"
+        CodeSearchDataset.create_distractors(
+            str(distractors_path),
+            num_distractors=1147,
+            start_idx=8650
+        )
 
     # Step 6: Print sample
     if training_data:

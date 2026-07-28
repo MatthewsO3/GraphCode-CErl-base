@@ -78,6 +78,10 @@ def step_deps():
         "tree-sitter-cpp",
         "tree-sitter-python",
         "ranx",
+        "numpy",
+        "tqdm",
+        "rank_bm25",
+        "datasets",
     ]
     run([str(VENV_PIP), "install"] + required)
     ok("Core dependencies installed")
